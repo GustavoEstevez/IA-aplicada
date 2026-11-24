@@ -1,6 +1,6 @@
 #define ProductName "VigiWork Servidor"
 #define ProductId "{{A9B152B1-19F2-48B4-9374-0B9DE1332431}"
-#define ProductVersion "1.0.1"
+#define ProductVersion "1.0.2"
 #define SourceRoot ".."
 
 [Setup]
@@ -24,6 +24,7 @@ UninstallDisplayName={#ProductName}
 UninstallFilesDir={app}\Uninstall
 CloseApplications=yes
 RestartApplications=no
+SetupLogging=yes
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -39,6 +40,15 @@ Source: "Preparar-Aplicacion.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
 [Icons]
 Name: "{autoprograms}\VigiWork Servidor"; Filename: "{app}\server\.venv\Scripts\pythonw.exe"; Parameters: """{app}\server\app.py"""; WorkingDir: "{app}\server"
 Name: "{autodesktop}\VigiWork Servidor"; Filename: "{app}\server\.venv\Scripts\pythonw.exe"; Parameters: """{app}\server\app.py"""; WorkingDir: "{app}\server"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\server\.venv\Scripts\pythonw.exe"; Parameters: """{app}\server\app.py"""; WorkingDir: "{app}\server"; Description: "Abrir VigiWork Servidor"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\server\.venv"
+Type: filesandordirs; Name: "{app}\server\models"
+Type: filesandordirs; Name: "{app}\server\tools"
+Type: filesandordirs; Name: "{app}\setup"
 
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);

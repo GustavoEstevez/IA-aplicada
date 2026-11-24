@@ -1,12 +1,15 @@
 $ErrorActionPreference = "Stop"
 $isccCandidates = @(
+    (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 7\ISCC.exe"),
+    "C:\Program Files\Inno Setup 7\ISCC.exe",
+    "C:\Program Files (x86)\Inno Setup 7\ISCC.exe",
     (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe"),
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
     "C:\Program Files\Inno Setup 6\ISCC.exe"
 )
 $isccCommand = Get-Command ISCC.exe -ErrorAction SilentlyContinue
 $compiler = if ($isccCommand) { $isccCommand.Source } else { $isccCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1 }
-if (-not $compiler) { throw "No se encontró Inno Setup 6. Instalalo y volvé a ejecutar este archivo." }
+if (-not $compiler) { throw "No se encontró Inno Setup 6 o 7. Instalalo y volvé a ejecutar este archivo." }
 
 $output = Join-Path $PSScriptRoot "salida"
 New-Item -ItemType Directory -Path $output -Force | Out-Null
