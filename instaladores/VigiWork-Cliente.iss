@@ -1,6 +1,6 @@
 #define ProductName "VigiWork Cliente"
 #define ProductId "{{2E6B3E0E-760B-4E46-A17F-A4758134C9BF}"
-#define ProductVersion "1.0.1"
+#define ProductVersion "1.0.2"
 #define SourceRoot ".."
 
 [Setup]
@@ -24,6 +24,7 @@ UninstallDisplayName={#ProductName}
 UninstallFilesDir={app}\Uninstall
 CloseApplications=yes
 RestartApplications=no
+SetupLogging=yes
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
@@ -39,6 +40,13 @@ Source: "Preparar-Aplicacion.ps1"; DestDir: "{app}\setup"; Flags: ignoreversion
 [Icons]
 Name: "{autoprograms}\VigiWork Cliente"; Filename: "{app}\client\.venv\Scripts\pythonw.exe"; Parameters: """{app}\client\app.py"""; WorkingDir: "{app}\client"
 Name: "{autodesktop}\VigiWork Cliente"; Filename: "{app}\client\.venv\Scripts\pythonw.exe"; Parameters: """{app}\client\app.py"""; WorkingDir: "{app}\client"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\client\.venv\Scripts\pythonw.exe"; Parameters: """{app}\client\app.py"""; WorkingDir: "{app}\client"; Description: "Abrir VigiWork Cliente"; Flags: nowait postinstall skipifsilent
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\client\.venv"
+Type: filesandordirs; Name: "{app}\setup"
 
 [Code]
 procedure CurStepChanged(CurStep: TSetupStep);
