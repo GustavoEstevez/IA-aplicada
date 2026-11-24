@@ -1,3 +1,9 @@
 .venv/
 __pycache__/
 *.py[cod]
+server/models/*.onnx
+server/cameras.json
+server/cameras.json.tmp
+server/access_key.txt
+server/access_key.txt.tmp
+server/tools/cloudflared.exe
