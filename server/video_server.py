@@ -93,6 +93,14 @@ class VideoHub:
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
+            def handle(self) -> None:
+                try:
+                    super().handle()
+                except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+                    # Los navegadores y clientes MJPEG suelen cerrar sockets sin completar
+                    # otra solicitud HTTP. No es un fallo del servidor.
+                    pass
+
             def _authorized(self) -> bool:
                 expected = hub.access_key
                 supplied = self.headers.get("Authorization", "")
