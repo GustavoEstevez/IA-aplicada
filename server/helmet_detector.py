@@ -177,6 +177,10 @@ class AsyncHelmetDetector:
         with self._condition:
             return self._inference_fps
 
+    def set_max_fps(self, max_fps: float) -> None:
+        with self._condition:
+            self._submit_interval = 1.0 / max(0.25, float(max_fps))
+
     def submit(self, frame) -> None:
         # Reemplazar el pendiente mantiene la latencia acotada: nunca se forma
         # una cola de cuadros antiguos si la IA es más lenta que la cámara.
@@ -234,7 +238,11 @@ class AsyncHelmetDetector:
                 return
             with self._condition:
                 self._latest = detections
-                self._inference_fps = 1.0 / elapsed if elapsed > 0 else 0.0
+                current_fps = 1.0 / elapsed if elapsed > 0 else 0.0
+                if self._inference_fps <= 0:
+                    self._inference_fps = current_fps
+                else:
+                    self._inference_fps = self._inference_fps * 0.75 + current_fps * 0.25
 
 
 def load_detector() -> HelmetDetector:

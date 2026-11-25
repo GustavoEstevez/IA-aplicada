@@ -12,10 +12,11 @@ import time
 import secrets
 import shutil
 import subprocess
+from collections import deque
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
@@ -48,6 +49,42 @@ def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int
 STREAM_MAX_WIDTH = _bounded_int_env("VIGIWORK_STREAM_MAX_WIDTH", 960, 480, 1920)
 STREAM_JPEG_QUALITY = _bounded_int_env("VIGIWORK_JPEG_QUALITY", 65, 40, 90)
 AI_MAX_FPS = _bounded_int_env("VIGIWORK_AI_MAX_FPS", 6, 1, 15)
+PROFILE_UTILIZATION = {
+    0: 0.82,  # Auto: deja margen para captura, interfaz y túnel.
+    1: 0.60,
+    2: 0.65,
+    3: 0.70,
+    4: 0.75,
+    5: 0.80,
+    6: 0.85,
+    7: 0.90,
+    8: 0.95,
+    9: 1.00,
+}
+
+
+def _rolling_fps(timestamps: deque[float], now: float, window: float = 5.0) -> float:
+    timestamps.append(now)
+    cutoff = now - window
+    while len(timestamps) > 1 and timestamps[0] < cutoff:
+        timestamps.popleft()
+    if len(timestamps) < 2:
+        return 0.0
+    elapsed = timestamps[-1] - timestamps[0]
+    return (len(timestamps) - 1) / elapsed if elapsed > 0 else 0.0
+
+
+def _profile_label(level: int) -> str:
+    return "Auto" if level == 0 else f"Nivel {level}"
+
+
+def _target_ai_rate(camera_fps: float, inference_capacity: float, level: int) -> float:
+    if inference_capacity <= 0:
+        return float(AI_MAX_FPS)
+    utilization = PROFILE_UTILIZATION.get(level, PROFILE_UTILIZATION[0])
+    available_fps = inference_capacity * utilization
+    camera_limit = camera_fps if camera_fps > 0 else available_fps
+    return max(0.25, min(camera_limit, available_fps))
 
 
 def load_access_key() -> str:
@@ -193,19 +230,130 @@ class CameraPreviewDialog(QDialog):
         self.status.setText(message)
 
 
+class AsyncStreamPublisher:
+    """Comprime y publica el cuadro más reciente sin frenar la captura RTSP."""
+
+    def __init__(self, video_hub: VideoHub):
+        self.video_hub = video_hub
+        self._condition = threading.Condition()
+        self._pending_frame = None
+        self._stopping = False
+        self._published_times: deque[float] = deque()
+        self._error = ""
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="mjpeg-encoder",
+        )
+        self._thread.start()
+
+    @property
+    def output_fps(self) -> float:
+        with self._condition:
+            now = time.monotonic()
+            cutoff = now - 5.0
+            while len(self._published_times) > 1 and self._published_times[0] < cutoff:
+                self._published_times.popleft()
+            if len(self._published_times) < 2 or now - self._published_times[-1] > 2.0:
+                return 0.0
+            elapsed = self._published_times[-1] - self._published_times[0]
+            return (len(self._published_times) - 1) / elapsed if elapsed > 0 else 0.0
+
+    @property
+    def error(self) -> str:
+        with self._condition:
+            return self._error
+
+    def submit(self, frame) -> None:
+        with self._condition:
+            if self._stopping or self._pending_frame is not None:
+                return
+        snapshot = frame.copy()
+        with self._condition:
+            if self._stopping or self._pending_frame is not None:
+                return
+            self._pending_frame = snapshot
+            self._condition.notify()
+
+    def clear(self) -> None:
+        with self._condition:
+            self._pending_frame = None
+            self._published_times.clear()
+            self._error = ""
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stopping = True
+            self._pending_frame = None
+            self._condition.notify_all()
+        if self._thread.is_alive():
+            self._thread.join(timeout=3)
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._pending_frame is not None or self._stopping
+                )
+                if self._stopping:
+                    return
+                frame, self._pending_frame = self._pending_frame, None
+            try:
+                height, width = frame.shape[:2]
+                if width > STREAM_MAX_WIDTH:
+                    stream_height = max(1, round(height * STREAM_MAX_WIDTH / width))
+                    frame = cv2.resize(
+                        frame,
+                        (STREAM_MAX_WIDTH, stream_height),
+                        interpolation=cv2.INTER_AREA,
+                    )
+                encoded, buffer = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_JPEG_QUALITY],
+                )
+                if not encoded:
+                    raise RuntimeError("OpenCV no pudo comprimir el cuadro JPEG.")
+                if self.video_hub.running:
+                    self.video_hub.publish(buffer.tobytes())
+                    with self._condition:
+                        self._published_times.append(time.monotonic())
+                        self._error = ""
+            except Exception as exc:
+                with self._condition:
+                    self._error = str(exc)
+
+
 class StreamWorker(QObject):
     frame = Signal(QImage)
     status = Signal(str, str)
     finished = Signal()
 
-    def __init__(self, url: str, video_hub: VideoHub, ai_enabled: bool = True, preview_enabled: bool = False):
+    def __init__(
+        self,
+        url: str,
+        video_hub: VideoHub,
+        ai_enabled: bool = True,
+        preview_enabled: bool = False,
+        performance_level: int = 0,
+    ):
         super().__init__()
         self.url = url
         self.video_hub = video_hub
         self.ai_enabled = ai_enabled
         self.preview_enabled = preview_enabled
+        self._performance_level = performance_level if performance_level in PROFILE_UTILIZATION else 0
+        self._performance_lock = threading.Lock()
         self._stop = threading.Event()
         self.capture = None
+
+    def set_performance_level(self, level: int) -> None:
+        with self._performance_lock:
+            self._performance_level = level if level in PROFILE_UTILIZATION else 0
+
+    def performance_level(self) -> int:
+        with self._performance_lock:
+            return self._performance_level
 
     def stop(self) -> None:
         self._stop.set()
@@ -246,7 +394,9 @@ class StreamWorker(QObject):
 
     def run(self) -> None:
         async_detector: AsyncHelmetDetector | None = None
+        stream_publisher: AsyncStreamPublisher | None = None
         try:
+            stream_publisher = AsyncStreamPublisher(self.video_hub)
             detector = None
             if self.ai_enabled:
                 self.status.emit("Cargando detector de cascos…", "working")
@@ -263,16 +413,19 @@ class StreamWorker(QObject):
                     self.capture = self._open_camera()
                     if async_detector is not None:
                         async_detector.clear()
+                    stream_publisher.clear()
                     connected_at = time.monotonic()
                     self.status.emit(f"En vivo · {backend}", "live")
                     last_status_at = 0.0
-                    capture_started_at = time.monotonic()
-                    capture_frames = 0
+                    capture_times: deque[float] = deque()
+                    camera_fps = 0.0
+                    target_ai_fps = float(AI_MAX_FPS)
                     while not self._stop.is_set():
                         ok, frame = self.capture.read()
                         if not ok or frame is None:
                             raise RuntimeError("La cámara dejó de enviar video.")
-                        capture_frames += 1
+                        now = time.monotonic()
+                        camera_fps = _rolling_fps(capture_times, now)
                         if async_detector is not None:
                             async_detector.submit(frame)
                             helmets, inference_error = async_detector.latest()
@@ -298,37 +451,32 @@ class StreamWorker(QObject):
                             ).copy()
                             self.frame.emit(image)
                         if self.video_hub.running:
-                            stream_frame = frame
-                            height, width = frame.shape[:2]
-                            if width > STREAM_MAX_WIDTH:
-                                stream_height = max(1, round(height * STREAM_MAX_WIDTH / width))
-                                stream_frame = cv2.resize(
-                                    frame,
-                                    (STREAM_MAX_WIDTH, stream_height),
-                                    interpolation=cv2.INTER_AREA,
-                                )
-                            encoded, buffer = cv2.imencode(
-                                ".jpg",
-                                stream_frame,
-                                [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_JPEG_QUALITY],
-                            )
-                            if encoded:
-                                self.video_hub.publish(buffer.tobytes())
-                        now = time.monotonic()
+                            stream_publisher.submit(frame)
                         if now - last_status_at >= 1.0:
-                            capture_elapsed = now - capture_started_at
-                            capture_fps = capture_frames / capture_elapsed if capture_elapsed > 0 else 0.0
-                            capture_started_at = now
-                            capture_frames = 0
+                            level = self.performance_level()
+                            profile = _profile_label(level)
+                            stream_fps = stream_publisher.output_fps
                             if detector is None:
-                                message = f"En vivo · Video {capture_fps:.1f} FPS · IA apagada"
+                                message = (
+                                    f"En vivo · Cámara {camera_fps:.1f} FPS · "
+                                    f"Transmisión {stream_fps:.1f} FPS · IA apagada"
+                                )
                             else:
                                 inference_fps = async_detector.inference_fps if async_detector else 0.0
+                                if async_detector is not None and inference_fps > 0:
+                                    target_ai_fps = _target_ai_rate(
+                                        camera_fps, inference_fps, level
+                                    )
+                                    async_detector.set_max_fps(target_ai_fps)
                                 message = (
-                                    f"En vivo · Video {capture_fps:.1f} FPS · IA {backend} "
-                                    f"{inference_fps:.1f} FPS · Cascos: {helmet_count} "
+                                    f"En vivo · Cámara {camera_fps:.1f} FPS · "
+                                    f"Transmisión {stream_fps:.1f} FPS · IA {backend} "
+                                    f"{inference_fps:.1f}/{target_ai_fps:.1f} FPS · {profile} · "
+                                    f"Cascos: {helmet_count} "
                                     f"· Sin casco: {no_helmet_count}"
                                 )
+                            if stream_publisher.error:
+                                message += f" · Error de transmisión: {stream_publisher.error}"
                             self.status.emit(message, "live")
                             last_status_at = now
                 except Exception as exc:
@@ -356,6 +504,8 @@ class StreamWorker(QObject):
         finally:
             if async_detector is not None:
                 async_detector.stop()
+            if stream_publisher is not None:
+                stream_publisher.stop()
             self._release_capture()
             self.video_hub.clear()
             self.finished.emit()
@@ -375,6 +525,12 @@ class MainWindow(QMainWindow):
         self._cameras: list[dict[str, object]] = []
         self._applied_cameras: list[dict[str, object]] = []
         self._has_pending_changes = False
+        self.settings = QSettings("VigiWork", "VigiWorkServer")
+        try:
+            saved_level = int(self.settings.value("performance/level", 0))
+        except (TypeError, ValueError):
+            saved_level = 0
+        self.performance_level = saved_level if saved_level in PROFILE_UTILIZATION else 0
         self.access_key = load_access_key()
         self.video_hub = VideoHub()
         self.video_hub.set_access_key(self.access_key)
@@ -441,6 +597,26 @@ class MainWindow(QMainWindow):
         self.test_button.setObjectName("primary")
         self.test_button.clicked.connect(self.test_camera)
         layout.addWidget(self.test_button)
+
+        performance_row = QHBoxLayout()
+        performance_row.addWidget(QLabel("Perfil de potencia"))
+        self.performance_selector = QComboBox()
+        self.performance_selector.addItem("Auto · ajuste continuo", 0)
+        for level in range(1, 10):
+            percentage = round(PROFILE_UTILIZATION[level] * 100)
+            self.performance_selector.addItem(f"Nivel {level} · {percentage}%", level)
+        selected_profile = self.performance_selector.findData(self.performance_level)
+        self.performance_selector.setCurrentIndex(max(0, selected_profile))
+        self.performance_selector.currentIndexChanged.connect(self._performance_profile_changed)
+        performance_row.addWidget(self.performance_selector, 1)
+        layout.addLayout(performance_row)
+        self.performance_help = QLabel(
+            "Auto mide la cámara y la velocidad real de inferencia; los niveles manuales "
+            "reservan entre 60% y 100% de la capacidad medida para la IA."
+        )
+        self.performance_help.setObjectName("subtle")
+        self.performance_help.setWordWrap(True)
+        layout.addWidget(self.performance_help)
 
         server_row = QHBoxLayout()
         self.server_button = QPushButton("Iniciar servidor")
@@ -513,7 +689,13 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         ai_enabled = bool(camera.get("ai_enabled", True)) if camera else item.checkState(1) == Qt.CheckState.Checked
         preview_enabled = bool(self.preview_window and self.preview_window.isVisible())
-        worker = StreamWorker(str(url), self.video_hub, ai_enabled, preview_enabled)
+        worker = StreamWorker(
+            str(url),
+            self.video_hub,
+            ai_enabled,
+            preview_enabled,
+            self.performance_level,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.status.connect(self.show_status)
@@ -528,6 +710,17 @@ class MainWindow(QMainWindow):
         thread.start()
         if preview_enabled:
             self.test_button.setText("Cerrar prueba")
+
+    def _performance_profile_changed(self, _index: int) -> None:
+        level = int(self.performance_selector.currentData())
+        self.performance_level = level if level in PROFILE_UTILIZATION else 0
+        self.settings.setValue("performance/level", self.performance_level)
+        if self.worker is not None:
+            self.worker.set_performance_level(self.performance_level)
+        self._set_status(
+            f"Perfil {_profile_label(self.performance_level)} seleccionado; "
+            "el ajuste se aplica en vivo según la cámara y el hardware."
+        )
 
     def test_camera(self) -> None:
         if self.preview_window and self.preview_window.isVisible():
