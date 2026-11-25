@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -21,6 +23,9 @@ HELMET_CLASS_ID = 0
 NO_HELMET_CLASS_ID = 2
 CONFIDENCE_THRESHOLD = 0.35
 NMS_THRESHOLD = 0.45
+OPENCL_ENABLED = os.environ.get("VIGIWORK_ENABLE_OPENCL", "").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 
 
 class HelmetDetector:
@@ -42,16 +47,18 @@ class HelmetDetector:
             except Exception:
                 pass
 
-        try:
-            if cv2.ocl.haveOpenCL():
-                cv2.ocl.setUseOpenCL(True)
-                self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-                self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_OPENCL)
-                self.backend = "GPU · OpenCL"
-                return
-        except Exception:
-            pass
+        if OPENCL_ENABLED:
+            try:
+                if cv2.ocl.haveOpenCL():
+                    cv2.ocl.setUseOpenCL(True)
+                    self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                    self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_OPENCL)
+                    self.backend = "GPU · OpenCL"
+                    return
+            except Exception:
+                pass
 
+        cv2.ocl.setUseOpenCL(False)
         self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
         self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         self.backend = "CPU"
@@ -74,6 +81,7 @@ class HelmetDetector:
             if self.backend == "CPU":
                 raise
             self.net = cv2.dnn.readNetFromONNX(str(self.model_path))
+            cv2.ocl.setUseOpenCL(False)
             self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
             self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
             self.backend = "CPU · fallback"
@@ -138,6 +146,95 @@ class HelmetDetector:
             if not conflict:
                 filtered.append(detection)
         return filtered
+
+
+class AsyncHelmetDetector:
+    """Ejecuta la inferencia sin bloquear la captura ni acumular cuadros viejos."""
+
+    def __init__(self, detector: HelmetDetector, max_fps: int = 6):
+        self.detector = detector
+        self._submit_interval = 1.0 / max(1, max_fps)
+        self._last_submit_at = 0.0
+        self._condition = threading.Condition()
+        self._pending_frame = None
+        self._latest: list[tuple[int, int, int, int, float, bool]] = []
+        self._error: Exception | None = None
+        self._inference_fps = 0.0
+        self._stopping = False
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="helmet-inference",
+        )
+        self._thread.start()
+
+    @property
+    def backend(self) -> str:
+        return self.detector.backend
+
+    @property
+    def inference_fps(self) -> float:
+        with self._condition:
+            return self._inference_fps
+
+    def submit(self, frame) -> None:
+        # Reemplazar el pendiente mantiene la latencia acotada: nunca se forma
+        # una cola de cuadros antiguos si la IA es más lenta que la cámara.
+        now = time.monotonic()
+        with self._condition:
+            if (
+                self._stopping
+                or self._error is not None
+                or now - self._last_submit_at < self._submit_interval
+            ):
+                return
+            self._last_submit_at = now
+        snapshot = frame.copy()
+        with self._condition:
+            if self._stopping or self._error is not None:
+                return
+            self._pending_frame = snapshot
+            self._condition.notify()
+
+    def latest(self) -> tuple[list[tuple[int, int, int, int, float, bool]], Exception | None]:
+        with self._condition:
+            return list(self._latest), self._error
+
+    def clear(self) -> None:
+        with self._condition:
+            self._pending_frame = None
+            self._latest = []
+            self._last_submit_at = 0.0
+
+    def stop(self) -> None:
+        with self._condition:
+            self._stopping = True
+            self._pending_frame = None
+            self._condition.notify_all()
+        if self._thread.is_alive():
+            self._thread.join(timeout=3)
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._pending_frame is not None or self._stopping
+                )
+                if self._stopping:
+                    return
+                frame, self._pending_frame = self._pending_frame, None
+            try:
+                started = time.monotonic()
+                detections = self.detector.detect(frame)
+                elapsed = time.monotonic() - started
+            except Exception as exc:
+                with self._condition:
+                    self._error = exc
+                    self._latest = []
+                return
+            with self._condition:
+                self._latest = detections
+                self._inference_fps = 1.0 / elapsed if elapsed > 0 else 0.0
 
 
 def load_detector() -> HelmetDetector:

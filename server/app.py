@@ -28,13 +28,26 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from shared.theme import APP_STYLESHEET, app_icon, brand_header, scrollable
-from helmet_detector import draw_helmets, load_detector
+from helmet_detector import AsyncHelmetDetector, draw_helmets, load_detector
 from video_server import VideoHub
 
 CAMERAS_FILE = Path(__file__).resolve().parent / "cameras.json"
 ACCESS_KEY_FILE = Path(__file__).resolve().parent / "access_key.txt"
 CLOUDFLARED_FILE = Path(__file__).resolve().parent / "tools" / "cloudflared.exe"
 CLOUDFLARE_URL_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com", re.I)
+
+
+def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
+
+
+STREAM_MAX_WIDTH = _bounded_int_env("VIGIWORK_STREAM_MAX_WIDTH", 960, 480, 1920)
+STREAM_JPEG_QUALITY = _bounded_int_env("VIGIWORK_JPEG_QUALITY", 65, 40, 90)
+AI_MAX_FPS = _bounded_int_env("VIGIWORK_AI_MAX_FPS", 6, 1, 15)
 
 
 def load_access_key() -> str:
@@ -232,11 +245,13 @@ class StreamWorker(QObject):
         return capture
 
     def run(self) -> None:
+        async_detector: AsyncHelmetDetector | None = None
         try:
             detector = None
             if self.ai_enabled:
                 self.status.emit("Cargando detector de cascos…", "working")
                 detector = load_detector()
+                async_detector = AsyncHelmetDetector(detector, AI_MAX_FPS)
             if self._stop.is_set():
                 return
             backend = detector.backend if detector is not None else "IA apagada"
@@ -246,18 +261,33 @@ class StreamWorker(QObject):
                 try:
                     self.status.emit("Conectando a la cámara RTSP…", "working")
                     self.capture = self._open_camera()
+                    if async_detector is not None:
+                        async_detector.clear()
                     connected_at = time.monotonic()
                     self.status.emit(f"En vivo · {backend}", "live")
                     last_status_at = 0.0
+                    capture_started_at = time.monotonic()
+                    capture_frames = 0
                     while not self._stop.is_set():
                         ok, frame = self.capture.read()
                         if not ok or frame is None:
                             raise RuntimeError("La cámara dejó de enviar video.")
-                        if detector is not None:
-                            helmets = detector.detect(frame)
+                        capture_frames += 1
+                        if async_detector is not None:
+                            async_detector.submit(frame)
+                            helmets, inference_error = async_detector.latest()
+                            if inference_error is not None:
+                                self.status.emit(
+                                    f"La IA se desactivó por un error; el video continúa: {inference_error}",
+                                    "error",
+                                )
+                                async_detector.stop()
+                                async_detector = None
+                                detector = None
+                                helmets = []
                             helmet_count, no_helmet_count = draw_helmets(frame, helmets)
-                            if detector.backend != backend:
-                                backend = detector.backend
+                            if async_detector is not None and async_detector.backend != backend:
+                                backend = async_detector.backend
                         else:
                             helmet_count = no_helmet_count = 0
                         if self.preview_enabled:
@@ -268,18 +298,35 @@ class StreamWorker(QObject):
                             ).copy()
                             self.frame.emit(image)
                         if self.video_hub.running:
+                            stream_frame = frame
+                            height, width = frame.shape[:2]
+                            if width > STREAM_MAX_WIDTH:
+                                stream_height = max(1, round(height * STREAM_MAX_WIDTH / width))
+                                stream_frame = cv2.resize(
+                                    frame,
+                                    (STREAM_MAX_WIDTH, stream_height),
+                                    interpolation=cv2.INTER_AREA,
+                                )
                             encoded, buffer = cv2.imencode(
-                                ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90]
+                                ".jpg",
+                                stream_frame,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), STREAM_JPEG_QUALITY],
                             )
                             if encoded:
                                 self.video_hub.publish(buffer.tobytes())
                         now = time.monotonic()
                         if now - last_status_at >= 1.0:
+                            capture_elapsed = now - capture_started_at
+                            capture_fps = capture_frames / capture_elapsed if capture_elapsed > 0 else 0.0
+                            capture_started_at = now
+                            capture_frames = 0
                             if detector is None:
-                                message = "En vivo · IA apagada"
+                                message = f"En vivo · Video {capture_fps:.1f} FPS · IA apagada"
                             else:
+                                inference_fps = async_detector.inference_fps if async_detector else 0.0
                                 message = (
-                                    f"En vivo · Detector {backend} · Cascos: {helmet_count} "
+                                    f"En vivo · Video {capture_fps:.1f} FPS · IA {backend} "
+                                    f"{inference_fps:.1f} FPS · Cascos: {helmet_count} "
                                     f"· Sin casco: {no_helmet_count}"
                                 )
                             self.status.emit(message, "live")
@@ -307,6 +354,8 @@ class StreamWorker(QObject):
             if not self._stop.is_set():
                 self.status.emit(f"No se pudo iniciar: {exc}", "error")
         finally:
+            if async_detector is not None:
+                async_detector.stop()
             self._release_capture()
             self.video_hub.clear()
             self.finished.emit()
@@ -865,7 +914,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
-    cv2.setNumThreads(max(1, min(4, cv2.getNumberOfCPUs())))
+    cv2.setNumThreads(max(1, min(8, cv2.getNumberOfCPUs())))
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

@@ -1,6 +1,6 @@
 #define ProductName "VigiWork Servidor"
 #define ProductId "{{A9B152B1-19F2-48B4-9374-0B9DE1332431}"
-#define ProductVersion "1.0.2"
+#define ProductVersion "1.0.5"
 #define SourceRoot ".."
 
 [Setup]
